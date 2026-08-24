@@ -410,6 +410,8 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    output_ids: Optional[List[int]] = None
+    output_token_logprobs: Optional[List[Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -690,6 +692,7 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    return_token_ids: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False

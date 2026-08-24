@@ -1204,7 +1204,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_output_ids = None
+            sglext_output_token_logprobs = None
+            if request.return_token_ids:
+                sglext_output_ids = content.get("output_ids")
+                if request.logprobs:
+                    sglext_output_token_logprobs = content["meta_info"].get(
+                        "output_token_logprobs"
+                    )
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_output_ids is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1213,6 +1226,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        output_ids=sglext_output_ids,
+                        output_token_logprobs=sglext_output_token_logprobs,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1299,10 +1314,18 @@ class OpenAIServingChat(OpenAIServingBase):
             first_ret, request
         )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        output_ids = first_ret.get("output_ids") if request.return_token_ids else None
+        output_token_logprobs = (
+            first_ret["meta_info"].get("output_token_logprobs")
+            if request.return_token_ids and request.logprobs
+            else None
+        )
+        if routed_experts or cached_tokens_details or output_ids is not None:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                output_ids=output_ids,
+                output_token_logprobs=output_token_logprobs,
             )
 
         for idx, ret_item in enumerate(ret):
