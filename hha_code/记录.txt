@@ -1,0 +1,120 @@
+这个代码是专门给 slime 用的，不能随便更改
+
+python3 -m sglang.launch_server \
+    --model /mnt/shared-storage-user/llmrazor-share/model/MiMo-7B-RL \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --mem-fraction-static 0.7 \
+    --disable-cuda-graph \
+    --log-level warning
+
+
+python3 -m sglang.launch_server \
+    --model /mnt/shared-storage-user/llmit/user/maningsheng/data/models/models--Qwen--Qwen3.5-35B-A3B \
+    --host 0.0.0.0 \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --enable-flashinfer-allreduce-fusion \
+    --mem-fraction-static 0.7
+
+
+
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+
+
+
+import debugpy
+debugpy.connect(('10.102.151.17', 5680))
+
+ss -ltnp | grep -E ':5680\b' 查看 debugpy server 是否已经启动。
+
+
+假设输入是 [1,2,3,4,5,6] input_ids
+
+1. 先 target model prefill 下得到 full hidden_status 和 next_id(verified_id)  logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
+                batch
+            )
+
+2. self.forward_draft_extend() 准备 draft_model prefill 的输入。full hidden_status + 一样长度的 input_ids，注意这个 input_ids 是 roll 左移一位的
+也就是 (input_ids[1:], self.verified_id[i].reshape(1))
+
+3. 构建好输入后，要对 draft model 执行一次 prefill，生成 kvcache 和 next_ids 的 topk_p, topk_index, hidden_states
+
+4. 然后进入到 speculative_num_steps 循环中， forward speculative_num_steps-1 步。因为第三步时候其实已经 forward 一次了。
+4.1 input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+4.2 logits_output = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+4.3 probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+    hidden_states = logits_output.hidden_states
+
+假设 speculative_num_steps=3, token_list 就是 3 个候选 token 还有额外信息方便给后续 target 模型进行验证，然后加上 target 模型第一次输出的 verified_id
+一共是 4 个 token
+
+
+5 构建长度是 4 的 input_ids, 输入给 target 模型进行 verify。
+batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+输出长度是 4 的 logits 进行后续处理。
+
+
+6 target 把每个位置的 token 预测出来 → 和 draft 提案逐个比对找最长匹配前缀 → 接受这些 token、释放其余 token 的 KV cache，并把“已确认 token + 对应 hidden_states”等打包成下一轮 draft 的输入。
+
+7 在 verify 阶段也可以用 topp 采样的，但是最终返回的是接收的 token 在 target 模型上的 logprob，不然 rl 也不对。
+
+
+ verify_tree_greedy 逐步验证（topk=1 线性链）
+
+  target_predict[0] == t1?
+    ├─ 否 → 接受 target_predict[0]（bonus），accept_length=1
+    └─ 是 → 接受 t1，继续
+             target_predict[1] == t2?
+               ├─ 否 → 接受 t1 + target_predict[1]，accept_length=2
+               └─ 是 → 接受 t2，继续
+                        target_predict[2] == t3?
+                          ├─ 否 → 接受 t1+t2 + target_predict[2]，accept_length=3
+                          └─ 是 → 接受 t1+t2+t3 + target_predict[3]，accept_length=4
+
+接收长度至少都是 1，因为第一个输入是 verified_id，一定会经过大模型预测一次，因此这个属于 bonus
+
+ Prefill 阶段：                                                                                                                                                      
+  - Target Extend 处理 5 个 prompt token，输出 h0~h4 和 verified_id=v0
+  - Draft Extend 用左移后的 input_ids + target hidden 建立 KV cache，得到第一个 draft 候选 d1                                                                         
+                                                                                                                                                                    
+  Decode Round 1 - Draft 阶段：
+  - step0：d1 免费（来自上轮），forward 写 KV slot0，得到 d2 和 draft_hidden dh1
+  - step1：第 1 次 draft forward，写 KV slot1，得到 d3
+  - step2：仅收集 tree_info，break，不再 forward
+  - 最终 draft_tokens = [v0, d1, d2, d3]
+
+  Decode Round 1 - Verify 阶段：通过菱形决策节点展示 4 个 case 的分支：
+  - Case A（0 个接受）：P0 ≠ d1，输出 1 token
+  - Case B（1 个接受）：P0=d1 但 P1≠d2，输出 2 tokens
+  - Case C（2 个接受）：P0=d1, P1=d2 但 P2≠d3，输出 3 tokens
+  - Case D（全部接受）：全部匹配，输出 4 tokens
+
+  Verify 后：KV 回收 + forward_draft_extend_after_decode 准备下一轮状态，并附有各 case 的初始状态对照表。
+
+
+
+export CUDA_HOME=/usr/local/cuda  
+export PATH="$CUDA_HOME/bin:$PATH"
+cd /mnt/shared-storage-user/huanghaian/code/slime_package/xtuner_sglang/sglang
+git checkout v0.5.10
+git tag -d v0.5.11 v0.5.12 v0.5.12.post1 v0.5.13 v0.5.13.post1
+rm -rf python/sglang.egg-info
+rm -f python/sglang/_version.py
+pip install -e ./python
+python -c "from sglang.cli.main import main; main()" version
+python -c "import sglang, torch; print(sglang.__file__); print(torch.__version__, torch.version.cuda)"
+
